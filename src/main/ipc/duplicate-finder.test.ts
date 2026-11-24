@@ -47,7 +47,11 @@ vi.mock('electron', () => ({
 vi.mock('./open-dialog', () => ({ showOpenDialog: vi.fn() }))
 vi.mock('../services/settings-store', () => ({ getSettings: () => mocks.settings }))
 
-import { registerDuplicateFinderIpc } from './duplicate-finder.ipc'
+import {
+  registerDuplicateFinderIpc,
+  detectFileProtection,
+  normalizeDuplicateStem
+} from './duplicate-finder.ipc'
 
 // We test the exported scan functions by creating a temp directory
 // with known duplicate files and scanning it via the module's internals.
@@ -548,5 +552,53 @@ describe('duplicate finder deletion safety', () => {
     await expect(remove([ccc], 'recycle')).rejects.toThrow('already in progress')
     release()
     expect((await pending).deleted).toBe(1)
+  })
+
+  it('protects Assetto Corsa sound banks and game assets from deletion, while allowing safe hard-link deduplication', async (ctx) => {
+    const carA = join(root, 'content', 'cars', 'car_a', 'sfx')
+    const carB = join(root, 'content', 'cars', 'car_b', 'sfx')
+    mkdirSync(carA, { recursive: true })
+    mkdirSync(carB, { recursive: true })
+    const bankA = join(carA, 'car_a.bank')
+    const bankB = join(carB, 'car_b.bank')
+    writeFileSync(bankA, 'fmod sound bank payload')
+    writeFileSync(bankB, 'fmod sound bank payload')
+
+    expect(detectFileProtection(bankA)).toBe('game-audio')
+    expect(detectFileProtection(join(carA, 'GUIDs.txt'))).toBe('game-audio')
+    expect(normalizeDuplicateStem('photo (1).jpg')).toBe('photo.jpg')
+    expect(normalizeDuplicateStem(bankA)).not.toBe(normalizeDuplicateStem(bankB))
+
+    const scanResult = await scan()
+    const bankGroup = scanResult.groups.find((g) => g.files.some((f) => f.path === bankA))
+    expect(bankGroup).toBeDefined()
+    expect(bankGroup!.hasProtectedFiles).toBe(true)
+    expect(bankGroup!.hasDistinctNames).toBe(true)
+    expect(bankGroup!.files.every((f) => f.protected && f.protectionKind === 'game-audio')).toBe(
+      true
+    )
+
+    // Deleting a protected game audio file in recycle or permanent mode is refused
+    const refused = await remove([bankB], 'permanent')
+    expect(refused).toMatchObject({ deleted: 0, failed: 1 })
+    expect(refused.errors[0].reason).toContain('Protected game or audio asset')
+    expect(existsSync(bankB)).toBe(true)
+
+    // Hard-link mode safely links bankB to bankA without deleting either path
+    if (!tryLink(() => {}, ctx)) return
+    const linked = await remove([bankB], 'hardlink')
+    expect(linked).toEqual({
+      deleted: 1,
+      failed: 0,
+      spaceRecovered: 'fmod sound bank payload'.length,
+      errors: []
+    })
+    expect(existsSync(bankA)).toBe(true)
+    expect(existsSync(bankB)).toBe(true)
+    const statA = lstatSync(bankA, { bigint: true })
+    const statB = lstatSync(bankB, { bigint: true })
+    if (statA.ino !== 0n) {
+      expect(statB.ino).toBe(statA.ino)
+    }
   })
 })

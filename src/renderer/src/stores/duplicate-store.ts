@@ -6,6 +6,17 @@ import type {
   DuplicateDeleteResult
 } from '@shared/types'
 
+export const DEFAULT_DUPLICATE_EXCLUDES = [
+  'node_modules',
+  '.git',
+  '$Recycle.Bin',
+  'System Volume Information',
+  'Windows',
+  'Program Files',
+  'Program Files (x86)',
+  'ProgramData'
+]
+
 interface DuplicateState {
   // Config
   directory: string | null
@@ -14,6 +25,7 @@ interface DuplicateState {
   excludePatterns: string[]
   extensionFilter: string[]
   maxDepth: number
+  protectGameAndAppFiles: boolean
 
   // Scan state
   status: 'idle' | 'scanning' | 'complete' | 'deleting'
@@ -32,6 +44,7 @@ interface DuplicateState {
   setExcludePatterns: (patterns: string[]) => void
   setExtensionFilter: (exts: string[]) => void
   setMaxDepth: (depth: number) => void
+  setProtectGameAndAppFiles: (protect: boolean) => void
   setStatus: (status: DuplicateState['status']) => void
   setProgress: (progress: DuplicateScanProgress | null) => void
   setResult: (result: DuplicateScanResult | null) => void
@@ -39,6 +52,7 @@ interface DuplicateState {
   setDeleteResult: (result: DuplicateDeleteResult | null) => void
   togglePath: (path: string) => void
   selectAllDuplicates: () => void
+  selectSafeDuplicates: () => void
   deselectAll: () => void
   removeDeletedFiles: (deletedPaths: Set<string>, failedPaths?: Set<string>) => void
   reset: () => void
@@ -48,9 +62,10 @@ export const useDuplicateStore = create<DuplicateState>((set, get) => ({
   directory: null,
   minFileSize: 1_048_576,
   maxFileSize: null,
-  excludePatterns: ['node_modules', '.git', '$Recycle.Bin'],
+  excludePatterns: [...DEFAULT_DUPLICATE_EXCLUDES],
   extensionFilter: [],
   maxDepth: 20,
+  protectGameAndAppFiles: true,
 
   status: 'idle',
   progress: null,
@@ -66,10 +81,31 @@ export const useDuplicateStore = create<DuplicateState>((set, get) => ({
   setExcludePatterns: (excludePatterns) => set({ excludePatterns }),
   setExtensionFilter: (extensionFilter) => set({ extensionFilter }),
   setMaxDepth: (maxDepth) => set({ maxDepth }),
+  setProtectGameAndAppFiles: (protectGameAndAppFiles) =>
+    set((s) => {
+      if (!protectGameAndAppFiles || s.deleteMode === 'hardlink' || !s.result) {
+        return { protectGameAndAppFiles }
+      }
+      const protectedSet = new Set(
+        s.result.groups.flatMap((g) => g.files.filter((f) => f.protected).map((f) => f.path))
+      )
+      const next = new Set([...s.selectedPaths].filter((p) => !protectedSet.has(p)))
+      return { protectGameAndAppFiles, selectedPaths: next }
+    }),
   setStatus: (status) => set({ status }),
   setProgress: (progress) => set({ progress }),
   setResult: (result) => set({ result }),
-  setDeleteMode: (deleteMode) => set({ deleteMode }),
+  setDeleteMode: (deleteMode) =>
+    set((s) => {
+      if (deleteMode === 'hardlink' || !s.protectGameAndAppFiles || !s.result) {
+        return { deleteMode }
+      }
+      const protectedSet = new Set(
+        s.result.groups.flatMap((g) => g.files.filter((f) => f.protected).map((f) => f.path))
+      )
+      const next = new Set([...s.selectedPaths].filter((p) => !protectedSet.has(p)))
+      return { deleteMode, selectedPaths: next }
+    }),
   setDeleteResult: (deleteResult) => set({ deleteResult }),
   togglePath: (path) =>
     set((s) => {
@@ -79,20 +115,47 @@ export const useDuplicateStore = create<DuplicateState>((set, get) => ({
         // Never select every copy in a group; at least one must always be kept
         const group = s.result?.groups.find((g) => g.files.some((f) => f.path === path))
         if (group?.files.every((f) => f.path === path || next.has(f.path))) return {}
+        const targetFile = group?.files.find((f) => f.path === path)
         // A hard-linked copy frees nothing, and the main process always refuses it.
-        if (group?.files.find((f) => f.path === path)?.hardLinked) return {}
+        if (targetFile?.hardLinked) return {}
+        // A protected game/audio/app asset cannot be deleted in recycle/permanent mode.
+        if (targetFile?.protected && s.protectGameAndAppFiles && s.deleteMode !== 'hardlink')
+          return {}
         next.add(path)
       }
       return { selectedPaths: next }
     }),
   selectAllDuplicates: () => {
-    const result = get().result
+    const { result, protectGameAndAppFiles, deleteMode } = get()
     if (!result) return
+    const blockProtected = protectGameAndAppFiles && deleteMode !== 'hardlink'
     const selected = new Set<string>()
     for (const group of result.groups) {
       // Keep the first-listed file — the one the main process also keeps (a
-      // hard-linked file before the shortest path) — and select the rest.
-      for (const file of group.files.slice(1)) if (!file.hardLinked) selected.add(file.path)
+      // hard-linked file before a protected asset before the shortest path) — and select the rest.
+      for (const file of group.files.slice(1)) {
+        if (file.hardLinked) continue
+        if (blockProtected && file.protected) continue
+        selected.add(file.path)
+      }
+    }
+    set({ selectedPaths: selected })
+  },
+  selectSafeDuplicates: () => {
+    const { result, protectGameAndAppFiles, deleteMode } = get()
+    if (!result) return
+    const blockProtected = protectGameAndAppFiles && deleteMode !== 'hardlink'
+    const selected = new Set<string>()
+    for (const group of result.groups) {
+      // Skip groups where files have distinct functional names (e.g. car1.bank vs car2.bank)
+      if (group.hasDistinctNames) continue
+      // In delete modes, skip groups that contain protected game/audio assets
+      if (blockProtected && group.hasProtectedFiles) continue
+      for (const file of group.files.slice(1)) {
+        if (file.hardLinked) continue
+        if (blockProtected && file.protected) continue
+        selected.add(file.path)
+      }
     }
     set({ selectedPaths: selected })
   },

@@ -1485,6 +1485,12 @@ export interface ShredderResult {
 
 // ─── Duplicate Finder ─────────────────────────────────────
 
+export type DuplicateProtectionKind =
+  | 'game-audio'
+  | 'game-asset'
+  | 'app-binary'
+  | 'game-directory'
+
 export interface DuplicateScanOptions {
   directory: string
   minFileSize: number
@@ -1492,6 +1498,8 @@ export interface DuplicateScanOptions {
   excludePatterns: string[]
   extensionFilter: string[]
   maxDepth: number
+  /** Protect game, audio bank (.bank, GUIDs.txt, etc.) and application assets from deletion. */
+  protectGameAndAppFiles?: boolean
 }
 
 export interface DuplicateFile {
@@ -1500,6 +1508,10 @@ export interface DuplicateFile {
   lastModified: number
   /** The file has other hard links, so deleting it would free no space. */
   hardLinked?: boolean
+  /** The file is a critical game, audio bank, or application asset that should not be deleted. */
+  protected?: boolean
+  /** Specific reason category why this file is protected from deletion. */
+  protectionKind?: DuplicateProtectionKind
 }
 
 export interface DuplicateGroup {
@@ -1508,6 +1520,10 @@ export interface DuplicateGroup {
   fileSize: number
   files: DuplicateFile[]
   reclaimableSpace: number
+  /** True if the group contains protected game/audio/app assets. */
+  hasProtectedFiles?: boolean
+  /** True if the files in this group have distinct functional base names (e.g. car1.bank vs car2.bank). */
+  hasDistinctNames?: boolean
 }
 
 export interface DuplicateScanResult {
@@ -1532,7 +1548,7 @@ export interface DuplicateScanProgress {
   filesHashed?: number
 }
 
-export type DuplicateDeleteMode = 'recycle' | 'permanent'
+export type DuplicateDeleteMode = 'recycle' | 'permanent' | 'hardlink'
 
 export interface DuplicateDeleteResult {
   deleted: number

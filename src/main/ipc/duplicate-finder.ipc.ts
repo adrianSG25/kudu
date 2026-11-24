@@ -1,9 +1,9 @@
 import { BrowserWindow, ipcMain, shell } from 'electron'
-import { readdir, lstat, realpath, rm } from 'fs/promises'
+import { readdir, lstat, realpath, rm, link, rename } from 'fs/promises'
 import { createReadStream } from 'fs'
 import type { BigIntStats } from 'fs'
 import { createHash } from 'crypto'
-import { join, extname, isAbsolute } from 'path'
+import { basename, dirname, join, extname, isAbsolute } from 'path'
 import { IPC } from '../../shared/channels'
 import type {
   DuplicateScanOptions,
@@ -12,7 +12,8 @@ import type {
   DuplicateScanResult,
   DuplicateScanProgress,
   DuplicateDeleteMode,
-  DuplicateDeleteResult
+  DuplicateDeleteResult,
+  DuplicateProtectionKind
 } from '../../shared/types'
 import type { WindowGetter } from './index'
 import { showOpenDialog } from './open-dialog'
@@ -39,6 +40,8 @@ interface ScannedGroup {
   paths: string[]
   /** Each member's file identity at scan time; ino 0 means the filesystem gave none. */
   identities: Map<string, FileIdentity>
+  /** Paths marked protected at scan time (game audio banks, game assets, app binaries). */
+  protectedPaths: Set<string>
 }
 
 interface FileIdentity {
@@ -55,6 +58,231 @@ interface WalkRecord {
   identities: Map<string, FileIdentity>
 }
 const scannedGroups = new Map<string, ScannedGroup>()
+
+// ── Game, Audio & Application Asset Protection ──
+
+const GAME_AUDIO_EXTENSIONS = new Set([
+  '.bank', // FMOD Studio sound banks (Assetto Corsa, ACC, ETS2, ATS, Forza, etc.)
+  '.fsb', // FMOD SoundBank
+  '.fev', // FMOD Events
+  '.bnk', // Wwise SoundBank
+  '.wem', // Wwise Encoded Media
+  '.pck', // Wwise / Godot Audio Package
+  '.xwb', // Microsoft XACT Wave Bank
+  '.xsb', // Microsoft XACT Sound Bank
+  '.xgs', // Microsoft XACT Global Settings
+  '.acb', // CRIWARE Audio Cue Sheet
+  '.awb', // CRIWARE Audio Wave Bank
+  '.hca', // CRIWARE High Compression Audio
+  '.adx', // CRIWARE ADX Audio
+  '.sab', // Square Enix Sound Asset
+  '.mab' // Square Enix Music Asset
+])
+
+const GAME_ASSET_EXTENSIONS = new Set([
+  '.kn5', // Assetto Corsa 3D Model
+  '.acd', // Assetto Corsa Packed Car Data
+  '.acreplay',
+  '.lut', // Assetto Corsa physics/graphics LUT curves
+  '.pak', // Unreal / Quake / CryEngine Package
+  '.vpk', // Source Engine Valve Pak
+  '.wad', // Doom / Half-Life WAD
+  '.assets', // Unity Assets
+  '.ress', // Unity Resource Stream
+  '.resource', // Unity Audio/Video Resource
+  '.bundle', // Unity AssetBundle
+  '.upk', // Unreal Package
+  '.uasset', // Unreal Asset
+  '.umap', // Unreal Map
+  '.uexp', // Unreal Export
+  '.ubulk', // Unreal Bulk Data
+  '.ucas', // Unreal IoStore Container
+  '.utoc', // Unreal IoStore Table of Contents
+  '.bsa', // Bethesda Softworks Archive
+  '.ba2', // Bethesda Archive v2
+  '.esm', // Elder Scrolls Master
+  '.esp', // Elder Scrolls Plugin
+  '.esl', // Elder Scrolls Light Plugin
+  '.rpf', // Rockstar RAGE Package File
+  '.scs', // SCS Software Archive
+  '.big', // EA BIG Archive
+  '.mpq', // Blizzard MoPaQ
+  '.xp3', // KiriKiri Package
+  '.arz', // Grim Dawn / Titan Quest Database
+  '.arc', // Game Archive
+  '.mas', // rFactor 2 MAS Archive
+  '.dds', // DirectDraw Surface Texture
+  '.vtf', // Valve Texture Format
+  '.vmt', // Valve Material Type
+  '.ktx', // Khronos Texture
+  '.cso', // Compiled Shader Object
+  '.fxc', // DirectX Effect Shader
+  '.dxbc', // DirectX Bytecode
+  '.dxil', // DirectX Intermediate Language
+  '.spv', // SPIR-V Shader
+  '.shadercache',
+  '.pso' // Pipeline State Object
+])
+
+const APP_BINARY_EXTENSIONS = new Set([
+  '.dll',
+  '.exe',
+  '.sys',
+  '.drv',
+  '.ocx',
+  '.so',
+  '.dylib',
+  '.asi',
+  '.cleo',
+  '.pyd',
+  '.node',
+  '.wasm',
+  '.mui',
+  '.cat',
+  '.manifest',
+  '.tlb',
+  '.pdb'
+])
+
+const GAME_AUDIO_FILENAMES = new Set([
+  'guids.txt', // FMOD event GUID table required in every Assetto Corsa car sfx folder
+  'cm_sfx_guids.txt',
+  'audio.ini',
+  'sfx.ini',
+  'sounds.ini'
+])
+
+const GAME_CRITICAL_FILENAMES = new Set([
+  'ui_car.json',
+  'ui_track.json',
+  'ui_skin.json',
+  'ext_config.ini',
+  'engine.ini',
+  'cameras.ini',
+  'tyres.ini',
+  'suspensions.ini',
+  'drivetrain.ini',
+  'aero.ini',
+  'car.ini',
+  'lods.ini',
+  'surfaces.ini',
+  'crew.ini',
+  'driver3d.ini',
+  'flame_presets.ini',
+  'lights.ini',
+  'mirrors.ini',
+  'proview_nodes.ini',
+  'script.ini',
+  'setup.ini',
+  'shadows.ini',
+  'wing_animations.ini'
+])
+
+const GAME_DIRECTORY_SEGMENTS = new Set([
+  'assettocorsa',
+  'assetto corsa',
+  'assetto corsa competizione',
+  'steamapps',
+  'steamlibrary',
+  'epic games',
+  'gog games',
+  'ubisoft game launcher',
+  'ea games',
+  'origin games',
+  'riot games',
+  'xboxgames',
+  'windowsapps',
+  'battle.net',
+  'streamingassets',
+  'gamedata',
+  'shadercache'
+])
+
+const DedicatedAudioSubfolders = new Set(['sfx', 'fmod', 'wwise', 'soundbanks'])
+const GeneralAudioSubfolders = new Set([
+  'sfx',
+  'sound',
+  'sounds',
+  'audio',
+  'voice',
+  'voices',
+  'music',
+  'bgm',
+  'fmod',
+  'wwise',
+  'soundbanks'
+])
+const MediaAudioExts = new Set(['.wav', '.ogg', '.mp3', '.flac', '.aac', '.wma', '.opus'])
+
+/**
+ * Classifies whether a path belongs to a game audio bank, game asset,
+ * application binary, or game directory that could break software if deleted.
+ */
+export function detectFileProtection(filePath: string): DuplicateProtectionKind | undefined {
+  const baseName = basename(filePath).toLowerCase()
+  const ext = extname(baseName).toLowerCase()
+  const normalized = filePath.toLowerCase().replace(/\\/g, '/')
+  const segments = normalized.split('/').filter(Boolean)
+  const dirSegments = segments.slice(0, -1)
+
+  if (GAME_AUDIO_EXTENSIONS.has(ext) || GAME_AUDIO_FILENAMES.has(baseName)) {
+    return 'game-audio'
+  }
+
+  const inDedicatedAudioDir = dirSegments.some((s) => DedicatedAudioSubfolders.has(s))
+  if (inDedicatedAudioDir) {
+    return 'game-audio'
+  }
+
+  const inGameDir =
+    dirSegments.some((s) => GAME_DIRECTORY_SEGMENTS.has(s)) ||
+    normalized.includes('/content/cars/') ||
+    normalized.includes('/content/tracks/') ||
+    normalized.includes('/content/sfx/') ||
+    normalized.includes('/extension/lua/') ||
+    normalized.includes('/extension/shaders/')
+
+  if (
+    inGameDir &&
+    (MediaAudioExts.has(ext) || dirSegments.some((s) => GeneralAudioSubfolders.has(s)))
+  ) {
+    return 'game-audio'
+  }
+
+  if (GAME_ASSET_EXTENSIONS.has(ext) || GAME_CRITICAL_FILENAMES.has(baseName)) {
+    return 'game-asset'
+  }
+
+  if (APP_BINARY_EXTENSIONS.has(ext)) {
+    return 'app-binary'
+  }
+
+  if (inGameDir) {
+    return 'game-directory'
+  }
+
+  return undefined
+}
+
+/**
+ * Normalizes a filename by stripping common duplicate suffixes such as
+ * " (1)", " - Copy", " - copia", "_copy" so true user copies match the original stem,
+ * while distinct component names (e.g. "bmw_m3.bank" vs "honda_ep3.bank") remain distinct.
+ */
+export function normalizeDuplicateStem(filePath: string): string {
+  const base = basename(filePath)
+  const ext = extname(base)
+  let stem = (ext ? base.slice(0, -ext.length) : base).toLowerCase().trim()
+  let prev = ''
+  while (stem !== prev) {
+    prev = stem
+    stem = stem
+      .replace(/\s*\(\d+\)$/, '')
+      .replace(/[\s_-]+(?:copy|copia|duplicado|duplicate)(?:[\s_-]*\d+)?$/i, '')
+      .trim()
+  }
+  return `${stem}${ext.toLowerCase()}`
+}
 
 // ── Progress helpers ──
 
@@ -129,7 +357,15 @@ async function walkDirectory(
         record.identities.set(fullPath, { dev: s.dev, ino: s.ino })
         if (s.nlink > 1n) record.linked.add(fullPath)
 
-        files.push({ path: fullPath, size, lastModified: Number(s.mtimeMs) })
+        const protectionKind =
+          options.protectGameAndAppFiles !== false ? detectFileProtection(fullPath) : undefined
+
+        files.push({
+          path: fullPath,
+          size,
+          lastModified: Number(s.mtimeMs),
+          ...(protectionKind ? { protected: true, protectionKind } : {})
+        })
 
         // Throttled progress
         const now = Date.now()
@@ -304,20 +540,27 @@ async function findDuplicates(
       if (files.length >= 2) {
         // List the copy to keep first: it is the one the UI marks "Keep" and the
         // one the delete handler preserves if every copy is requested. A file with
-        // other hard links comes first, since deleting it frees nothing; then the
-        // shortest path.
+        // other hard links comes first, since deleting it frees nothing; then a
+        // protected game/audio/app asset; then the shortest path.
         files.sort(
           (a, b) =>
-            Number(linked.has(b.path)) - Number(linked.has(a.path)) || a.path.length - b.path.length
+            Number(linked.has(b.path)) - Number(linked.has(a.path)) ||
+            Number(Boolean(b.protected)) - Number(Boolean(a.protected)) ||
+            a.path.length - b.path.length
         )
         for (const file of files) if (linked.has(file.path)) file.hardLinked = true
         const freeable = files.slice(1).filter((f) => !f.hardLinked).length
+        const hasProtectedFiles = files.some((f) => f.protected === true)
+        const stems = new Set(files.map((f) => normalizeDuplicateStem(f.path)))
+        const hasDistinctNames = stems.size > 1
         fullHashGroups.push({
           hash: fullHash.slice(0, 16),
           fullHash,
           fileSize: files[0].size,
           files,
-          reclaimableSpace: files[0].size * freeable
+          reclaimableSpace: files[0].size * freeable,
+          ...(hasProtectedFiles ? { hasProtectedFiles: true } : {}),
+          ...(hasDistinctNames ? { hasDistinctNames: true } : {})
         })
       }
     }
@@ -338,10 +581,12 @@ function rememberScan(
   scannedGroups.clear()
   for (const group of groups) {
     const paths = group.files.map((f) => f.path)
+    const protectedPaths = new Set(group.files.filter((f) => f.protected).map((f) => f.path))
     scannedGroups.set(group.fullHash, {
       fullHash: group.fullHash,
       size: group.fileSize,
       paths,
+      protectedPaths,
       identities: new Map(
         paths.flatMap((path) => {
           const identity = identities.get(path)
@@ -387,11 +632,13 @@ async function isIntactCopy(
   path: string,
   target: BigIntStats,
   targetRealPath: string,
-  group: ScannedGroup
+  group: ScannedGroup,
+  requireSameDevice = false
 ): Promise<boolean> {
   try {
     const s = await lstat(path, { bigint: true })
     if (!s.isFile() || Number(s.size) !== group.size) return false
+    if (requireSameDevice && s.dev !== target.dev) return false
     if (!stillScannedFile(path, s, await realpath(path), group)) return false
     // The same file reached another way (a hard link, or a directory swapped for a
     // link) would disappear with the target, so it does not count as a survivor.
@@ -417,52 +664,67 @@ async function isIntactCopy(
 }
 
 /**
- * Re-verify a file immediately before deleting it. Returns why it must be kept,
- * or null when it is still a duplicate and another intact copy remains.
+ * Re-verify a file immediately before deleting or hard-linking it.
+ * Returns why it must be kept, or null (with `survivorPath`) when it is still a duplicate
+ * and another intact copy remains.
  */
 async function reasonToKeep(
   filePath: string,
   group: ScannedGroup,
-  exclusions: string[]
-): Promise<string | null> {
+  exclusions: string[],
+  deleteMode: DuplicateDeleteMode = 'recycle'
+): Promise<{ reason: string | null; survivorPath?: string }> {
+  if (deleteMode !== 'hardlink' && group.protectedPaths.has(filePath)) {
+    return {
+      reason:
+        'Protected game or audio asset — use Hard Link mode to save space safely without losing game files'
+    }
+  }
   let target: BigIntStats
   let targetRealPath: string
   try {
     target = await lstat(filePath, { bigint: true })
     targetRealPath = await realpath(filePath)
   } catch {
-    return 'File no longer exists'
+    return { reason: 'File no longer exists' }
   }
   // lstat does not follow links, so a symlink swapped in here is rejected too.
-  if (!target.isFile()) return 'Path is no longer a regular file'
+  if (!target.isFile()) return { reason: 'Path is no longer a regular file' }
   // Another name keeps the data alive, so deleting this one would free nothing.
   if (target.nlink > 1n) {
-    return 'Other hard links to this file exist, so deleting it would not free any space'
+    return { reason: 'Other hard links to this file exist, so deleting it would not free any space' }
   }
   if (!stillScannedFile(filePath, target, targetRealPath, group)) {
-    return 'File was moved or replaced since the scan. Scan again before deleting.'
+    return { reason: 'File was moved or replaced since the scan. Scan again before deleting.' }
   }
   if (Number(target.size) !== group.size || !(await hashMatches(filePath, group.fullHash))) {
-    return 'File content changed since the scan. Scan again before deleting.'
+    return { reason: 'File content changed since the scan. Scan again before deleting.' }
   }
-  let survivor = false
+  let survivorPath: string | undefined
   for (const other of group.paths) {
     if (other === filePath) continue
     // An excluded file is never opened, so it can't be verified as the copy that stays.
     if (await isExcludedResolved(other, exclusions)) continue
-    if (await isIntactCopy(other, target, targetRealPath, group)) {
+    if (await isIntactCopy(other, target, targetRealPath, group, deleteMode === 'hardlink')) {
       // Hashing can take a while; an exclusion added meanwhile still disqualifies it.
       if (await isExcludedResolved(other, await expandExclusions(getSettings().exclusions)))
         continue
-      survivor = true
+      survivorPath = other
       break
     }
   }
-  if (!survivor) return 'No other intact copy remains, so this file was kept'
+  if (!survivorPath) {
+    return {
+      reason:
+        deleteMode === 'hardlink'
+          ? 'No other intact copy on the same drive remains to link against'
+          : 'No other intact copy remains, so this file was kept'
+    }
+  }
   // Exclusions may have changed during that verification. Check them before
   // the final identity check below, so nothing slow sits between it and the delete.
   if (await isExcludedResolved(filePath, await expandExclusions(getSettings().exclusions))) {
-    return 'excluded'
+    return { reason: 'excluded' }
   }
   // Checking survivors can take minutes on large files. Confirm the target is
   // still the exact file that was hashed before acting on its path.
@@ -478,12 +740,47 @@ async function reasonToKeep(
       now.ctimeNs !== target.ctimeNs ||
       !samePath(await realpath(filePath), targetRealPath)
     ) {
-      return 'File changed while it was being verified. Scan again before deleting.'
+      return { reason: 'File changed while it was being verified. Scan again before deleting.' }
     }
   } catch {
-    return 'File no longer exists'
+    return { reason: 'File no longer exists' }
   }
-  return null
+  return { reason: null, survivorPath }
+}
+
+/**
+ * Atomically replace `targetPath` with a filesystem hard link to `survivorPath`.
+ * Both paths remain accessible at their original names and locations (so games like
+ * Assetto Corsa never lose sound or assets), while occupying disk space only once.
+ */
+async function replaceWithHardLink(survivorPath: string, targetPath: string): Promise<void> {
+  const dir = dirname(targetPath)
+  const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const tempLink = join(dir, `.kudu-hl-${suffix}`)
+
+  // Create the hard link at a staging name first; if cross-device (EXDEV) or
+  // unsupported by the filesystem, this fails before targetPath is touched.
+  await link(survivorPath, tempLink)
+  try {
+    await rename(tempLink, targetPath)
+  } catch {
+    // Fallback if atomic overwrite rename is blocked on Windows: swap via backup name.
+    const backupPath = join(dir, `.kudu-bak-${suffix}`)
+    try {
+      await rename(targetPath, backupPath)
+    } catch (backupErr) {
+      await rm(tempLink, { force: true }).catch(() => {})
+      throw backupErr
+    }
+    try {
+      await rename(tempLink, targetPath)
+      await rm(backupPath, { force: true }).catch(() => {})
+    } catch (replaceErr) {
+      await rename(backupPath, targetPath).catch(() => {})
+      await rm(tempLink, { force: true }).catch(() => {})
+      throw replaceErr
+    }
+  }
 }
 
 // ── IPC registration ──
@@ -541,7 +838,8 @@ export function registerDuplicateFinderIpc(getWindow: WindowGetter): void {
         extensionFilter: Array.isArray(opts.extensionFilter)
           ? (opts.extensionFilter as unknown[]).filter((e): e is string => typeof e === 'string')
           : [],
-        maxDepth: typeof opts.maxDepth === 'number' && opts.maxDepth > 0 ? opts.maxDepth : 20
+        maxDepth: typeof opts.maxDepth === 'number' && opts.maxDepth > 0 ? opts.maxDepth : 20,
+        protectGameAndAppFiles: opts.protectGameAndAppFiles !== false
       }
 
       const exclusions = await expandExclusions(getSettings().exclusions)
@@ -638,7 +936,8 @@ export function registerDuplicateFinderIpc(getWindow: WindowGetter): void {
         const safePaths = [
           ...new Set(paths.filter((p): p is string => typeof p === 'string' && isAbsolute(p)))
         ]
-        const deleteMode: DuplicateDeleteMode = mode === 'permanent' ? 'permanent' : 'recycle'
+        const deleteMode: DuplicateDeleteMode =
+          mode === 'permanent' ? 'permanent' : mode === 'hardlink' ? 'hardlink' : 'recycle'
         const exclusions = await expandExclusions(getSettings().exclusions)
 
         let deleted = 0
@@ -684,17 +983,20 @@ export function registerDuplicateFinderIpc(getWindow: WindowGetter): void {
           for (const filePath of targets) {
             // Verification can take minutes on large files; it reads the exclusions
             // fresh and rechecks the target itself last, right before this delete.
-            const reason = await reasonToKeep(
+            const { reason, survivorPath } = await reasonToKeep(
               filePath,
               group,
-              await expandExclusions(getSettings().exclusions)
+              await expandExclusions(getSettings().exclusions),
+              deleteMode
             )
-            if (reason) {
-              skip(filePath, reason)
+            if (reason || !survivorPath) {
+              skip(filePath, reason || 'No other intact copy remains, so this file was kept')
               continue
             }
             try {
-              if (deleteMode === 'recycle') {
+              if (deleteMode === 'hardlink') {
+                await replaceWithHardLink(survivorPath, filePath)
+              } else if (deleteMode === 'recycle') {
                 await shell.trashItem(filePath)
               } else {
                 await rm(filePath, { force: true })

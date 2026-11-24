@@ -13,12 +13,16 @@ import {
   ExternalLink,
   Settings2,
   Plus,
-  Shield
+  Shield,
+  ShieldAlert,
+  Link2,
+  AlertTriangle
 } from 'lucide-react'
 import { cn, formatBytes } from '@/lib/utils'
 import { useDuplicateStore } from '@/stores/duplicate-store'
 import { ConfirmDialog } from '@/components/shared/ConfirmDialog'
 import { PageHeader } from '@/components/layout/PageHeader'
+import type { DuplicateProtectionKind } from '@shared/types'
 
 const SIZE_PRESETS = [
   { label: '100 KB', value: 102_400 },
@@ -79,6 +83,31 @@ export function DuplicateFinderPage() {
     return size
   }, [store.result, store.selectedPaths])
 
+  const protectedFilesCount = useMemo(() => {
+    if (!store.result) return 0
+    let count = 0
+    for (const group of store.result.groups) {
+      for (const file of group.files) {
+        if (file.protected) count++
+      }
+    }
+    return count
+  }, [store.result])
+
+  const getProtectionLabel = (kind?: DuplicateProtectionKind): string => {
+    switch (kind) {
+      case 'game-audio':
+        return t('protectedGameAudio')
+      case 'game-asset':
+        return t('protectedGameAsset')
+      case 'app-binary':
+        return t('protectedAppBinary')
+      case 'game-directory':
+      default:
+        return t('protectedGameDir')
+    }
+  }
+
   // ── Handlers ──
 
   const handleSelectDir = async () => {
@@ -97,13 +126,14 @@ export function DuplicateFinderPage() {
         maxFileSize: store.maxFileSize,
         excludePatterns: store.excludePatterns,
         extensionFilter: store.extensionFilter,
-        maxDepth: store.maxDepth
+        maxDepth: store.maxDepth,
+        protectGameAndAppFiles: store.protectGameAndAppFiles
       })
       if (result) {
         store.setResult(result)
         store.setStatus('complete')
         if (result.groups.length > 0) {
-          store.selectAllDuplicates()
+          store.selectSafeDuplicates()
         }
       }
     } catch {
@@ -133,7 +163,10 @@ export function DuplicateFinderPage() {
         store.removeDeletedFiles(successPaths, failedPaths)
         if (result.deleted > 0) {
           toast.success(
-            t('deleteSuccess', { count: result.deleted, size: formatBytes(result.spaceRecovered) })
+            t(store.deleteMode === 'hardlink' ? 'hardLinkSuccess' : 'deleteSuccess', {
+              count: result.deleted,
+              size: formatBytes(result.spaceRecovered)
+            })
           )
         }
         if (result.failed > 0) {
@@ -376,6 +409,27 @@ export function DuplicateFinderPage() {
               />
             </div>
 
+            {/* Game & audio protection toggle */}
+            <div className="col-span-2">
+              <label className="flex cursor-pointer items-start gap-3 rounded-xl p-3 transition-colors hover:bg-white/[0.02]">
+                <input
+                  type="checkbox"
+                  checked={store.protectGameAndAppFiles}
+                  onChange={(e) => store.setProtectGameAndAppFiles(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 cursor-pointer rounded accent-emerald-500"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 text-[12px] font-semibold text-white">
+                    <Shield className="h-3.5 w-3.5 text-emerald-400" />
+                    {t('protectGameFiles')}
+                  </div>
+                  <p className="mt-0.5 text-[11px]" style={{ color: 'var(--text-secondary)' }}>
+                    {t('protectGameFilesDesc')}
+                  </p>
+                </div>
+              </label>
+            </div>
+
             {/* Exclude patterns */}
             <div className="col-span-2">
               <label
@@ -489,6 +543,37 @@ export function DuplicateFinderPage() {
             </div>
           )}
 
+          {/* Game / Audio Protection Banner */}
+          {protectedFilesCount > 0 && store.protectGameAndAppFiles && (
+            <div
+              className="mb-4 flex items-start gap-3 rounded-xl px-4 py-3"
+              style={{
+                background: 'rgba(16,185,129,0.08)',
+                border: '1px solid rgba(16,185,129,0.22)'
+              }}
+            >
+              <Shield className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
+              <div className="min-w-0 flex-1">
+                <div className="text-[12px] font-semibold text-emerald-300">
+                  {t('protectionBannerTitle', { count: protectedFilesCount })}
+                </div>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-zinc-300">
+                  {t('protectionBannerDesc')}
+                </p>
+              </div>
+              {store.deleteMode !== 'hardlink' && (
+                <button
+                  onClick={() => store.setDeleteMode('hardlink')}
+                  className="flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-1.5 text-[11px] font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/20"
+                  style={{ background: 'rgba(16,185,129,0.14)' }}
+                >
+                  <Link2 className="h-3.5 w-3.5" />
+                  {t('hardLinkMode')}
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Summary stats */}
           <div className="mb-5 grid grid-cols-4 gap-3">
             <StatCard
@@ -510,13 +595,22 @@ export function DuplicateFinderPage() {
           {store.result.groups.length > 0 ? (
             <>
               {/* Action bar */}
-              <div className="mb-4 flex items-center gap-3">
+              <div className="mb-4 flex flex-wrap items-center gap-2.5">
+                <button
+                  onClick={() => store.selectSafeDuplicates()}
+                  className="flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-[12px] font-medium text-emerald-300 transition-colors hover:text-emerald-200"
+                  style={{ background: 'rgba(16,185,129,0.1)' }}
+                >
+                  <Shield className="h-3.5 w-3.5" />
+                  {t('selectSafeDuplicates')}
+                </button>
+
                 <button
                   onClick={() => {
                     if (selectedCount > 0) store.deselectAll()
                     else store.selectAllDuplicates()
                   }}
-                  className="rounded-xl px-4 py-2 text-[12px] font-medium text-zinc-400 transition-colors hover:text-zinc-200"
+                  className="rounded-xl px-3.5 py-2 text-[12px] font-medium text-zinc-400 transition-colors hover:text-zinc-200"
                   style={{ background: 'var(--bg-subtle-2)' }}
                 >
                   {selectedCount > 0 ? t('deselectAll') : t('selectAllDuplicates')}
@@ -540,6 +634,25 @@ export function DuplicateFinderPage() {
                     }
                   >
                     {t('recycleBin')}
+                  </button>
+                  <button
+                    onClick={() => store.setDeleteMode('hardlink')}
+                    className={cn(
+                      'flex items-center gap-1 px-3 py-1.5 text-[12px] font-medium transition-colors',
+                      store.deleteMode === 'hardlink' ? 'text-emerald-400' : 'text-zinc-500'
+                    )}
+                    style={
+                      store.deleteMode === 'hardlink'
+                        ? { background: 'rgba(16,185,129,0.12)' }
+                        : undefined
+                    }
+                    title={t('confirmHardLinkDesc', {
+                      count: selectedCount,
+                      size: formatBytes(selectedSize)
+                    })}
+                  >
+                    <Link2 className="h-3 w-3" />
+                    {t('hardLinkMode')}
                   </button>
                   <button
                     onClick={() => store.setDeleteMode('permanent')}
@@ -576,12 +689,26 @@ export function DuplicateFinderPage() {
                       background:
                         store.deleteMode === 'permanent'
                           ? 'rgba(239,68,68,0.12)'
-                          : 'rgba(245,158,11,0.12)',
-                      color: store.deleteMode === 'permanent' ? '#ef4444' : '#f59e0b'
+                          : store.deleteMode === 'hardlink'
+                            ? 'rgba(16,185,129,0.14)'
+                            : 'rgba(245,158,11,0.12)',
+                      color:
+                        store.deleteMode === 'permanent'
+                          ? '#ef4444'
+                          : store.deleteMode === 'hardlink'
+                            ? '#10b981'
+                            : '#f59e0b'
                     }}
                   >
-                    <Trash2 className="h-4 w-4" />
-                    {t('deleteSelected', { count: selectedCount, size: formatBytes(selectedSize) })}
+                    {store.deleteMode === 'hardlink' ? (
+                      <Link2 className="h-4 w-4" />
+                    ) : (
+                      <Trash2 className="h-4 w-4" />
+                    )}
+                    {t(
+                      store.deleteMode === 'hardlink' ? 'hardLinkSelected' : 'deleteSelected',
+                      { count: selectedCount, size: formatBytes(selectedSize) }
+                    )}
                   </button>
                 )}
               </div>
@@ -595,6 +722,9 @@ export function DuplicateFinderPage() {
                   const groupSelected = group.files.filter((f) =>
                     store.selectedPaths.has(f.path)
                   ).length
+                  const primaryName =
+                    sorted[0]?.path.split(/[\\/]/).pop() || group.hash
+                  const firstProtectedKind = sorted.find((f) => f.protected)?.protectionKind
 
                   return (
                     <div
@@ -615,13 +745,42 @@ export function DuplicateFinderPage() {
                         ) : (
                           <ChevronRight className="h-4 w-4 shrink-0 text-zinc-500" />
                         )}
-                        <div className="min-w-0 flex-1">
-                          <span className="text-[13px] font-medium text-white">
+                        <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                          <span className="truncate text-[13px] font-semibold text-white">
+                            {primaryName}
+                          </span>
+                          <span className="shrink-0 text-[12px] text-zinc-400">
                             {t('groupHeader', {
                               size: formatBytes(group.fileSize),
                               count: group.files.length
                             })}
                           </span>
+                          {group.hasProtectedFiles && (
+                            <span
+                              className="flex shrink-0 items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-semibold"
+                              style={{
+                                background: 'rgba(16,185,129,0.12)',
+                                color: '#34d399'
+                              }}
+                              title={t('protectedTooltip')}
+                            >
+                              <ShieldAlert className="h-3 w-3" />
+                              {getProtectionLabel(firstProtectedKind)}
+                            </span>
+                          )}
+                          {group.hasDistinctNames && (
+                            <span
+                              className="flex shrink-0 items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-semibold"
+                              style={{
+                                background: 'rgba(245,158,11,0.12)',
+                                color: '#fbbf24'
+                              }}
+                              title={t('distinctNamesTooltip')}
+                            >
+                              <AlertTriangle className="h-3 w-3" />
+                              {t('distinctNamesBadge')}
+                            </span>
+                          )}
                         </div>
                         {groupSelected > 0 && (
                           <span
@@ -654,6 +813,10 @@ export function DuplicateFinderPage() {
                             // Selecting this would leave no copy of the file behind
                             const isLastCopy =
                               !isSelected && groupSelected === group.files.length - 1
+                            const isLockedProtected =
+                              Boolean(file.protected) &&
+                              store.protectGameAndAppFiles &&
+                              store.deleteMode !== 'hardlink'
                             return (
                               <div
                                 key={file.path}
@@ -665,13 +828,15 @@ export function DuplicateFinderPage() {
                                 <input
                                   type="checkbox"
                                   checked={isSelected}
-                                  disabled={isLastCopy || file.hardLinked}
+                                  disabled={isLastCopy || file.hardLinked || isLockedProtected}
                                   title={
                                     file.hardLinked
                                       ? t('hardLinkedCopy')
-                                      : isLastCopy
-                                        ? t('keepOneCopy')
-                                        : undefined
+                                      : isLockedProtected
+                                        ? t('protectedTooltip')
+                                        : isLastCopy
+                                          ? t('keepOneCopy')
+                                          : undefined
                                   }
                                   onChange={() => store.togglePath(file.path)}
                                   className="h-3.5 w-3.5 shrink-0 cursor-pointer rounded accent-amber-500 disabled:cursor-not-allowed disabled:opacity-40"
@@ -683,6 +848,19 @@ export function DuplicateFinderPage() {
                                 >
                                   {file.path}
                                 </span>
+                                {file.protected && (
+                                  <span
+                                    className="flex shrink-0 items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-semibold"
+                                    style={{
+                                      background: 'rgba(16,185,129,0.1)',
+                                      color: '#34d399'
+                                    }}
+                                    title={t('protectedTooltip')}
+                                  >
+                                    <ShieldAlert className="h-3 w-3" />
+                                    {getProtectionLabel(file.protectionKind)}
+                                  </span>
+                                )}
                                 {isKept && (
                                   <span
                                     className="flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-semibold"
@@ -745,14 +923,24 @@ export function DuplicateFinderPage() {
         open={showConfirm}
         onConfirm={handleDelete}
         onCancel={() => setShowConfirm(false)}
-        title={t('confirmDeleteTitle')}
+        title={
+          store.deleteMode === 'hardlink' ? t('confirmHardLinkTitle') : t('confirmDeleteTitle')
+        }
         description={
           store.deleteMode === 'permanent'
             ? t('confirmPermanentDesc', { count: selectedCount, size: formatBytes(selectedSize) })
-            : t('confirmRecycleDesc', { count: selectedCount, size: formatBytes(selectedSize) })
+            : store.deleteMode === 'hardlink'
+              ? t('confirmHardLinkDesc', { count: selectedCount, size: formatBytes(selectedSize) })
+              : t('confirmRecycleDesc', { count: selectedCount, size: formatBytes(selectedSize) })
         }
         variant={store.deleteMode === 'permanent' ? 'danger' : 'warning'}
-        confirmLabel={store.deleteMode === 'permanent' ? t('permanentDelete') : t('recycleBin')}
+        confirmLabel={
+          store.deleteMode === 'permanent'
+            ? t('permanentDelete')
+            : store.deleteMode === 'hardlink'
+              ? t('hardLinkMode')
+              : t('recycleBin')
+        }
       />
     </div>
   )

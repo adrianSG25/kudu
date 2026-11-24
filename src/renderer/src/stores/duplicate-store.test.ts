@@ -354,4 +354,56 @@ describe('duplicate-store', () => {
     store.setStatus('deleting')
     expect(useDuplicateStore.getState().status).toBe('deleting')
   })
+
+  it('blocks selecting protected game audio files in delete modes, but allows them in hardlink mode', () => {
+    const result = makeResult([
+      {
+        hash: '1111222233334444111122223333444411112222333344441111222233334444',
+        fileSize: 5000,
+        paths: ['/games/ac/cars/car1/sfx/car1.bank', '/games/ac/cars/car2/sfx/car2.bank']
+      },
+      {
+        hash: '5555666677778888555566667777888855556666777788885555666677778888',
+        fileSize: 2000,
+        paths: ['/downloads/photo.jpg', '/downloads/photo (1).jpg']
+      }
+    ])
+    result.groups[0].hasProtectedFiles = true
+    result.groups[0].hasDistinctNames = true
+    result.groups[0].files[0].protected = true
+    result.groups[0].files[0].protectionKind = 'game-audio'
+    result.groups[0].files[1].protected = true
+    result.groups[0].files[1].protectionKind = 'game-audio'
+
+    const store = useDuplicateStore.getState()
+    store.setProtectGameAndAppFiles(true)
+    store.setDeleteMode('recycle')
+    store.setResult(result)
+
+    // Neither selectSafeDuplicates nor selectAllDuplicates selects protected game audio in recycle mode
+    store.selectSafeDuplicates()
+    expect([...useDuplicateStore.getState().selectedPaths]).toEqual(['/downloads/photo (1).jpg'])
+
+    store.selectAllDuplicates()
+    expect([...useDuplicateStore.getState().selectedPaths]).toEqual(['/downloads/photo (1).jpg'])
+
+    // Manual toggle is also blocked in recycle mode
+    store.togglePath('/games/ac/cars/car2/sfx/car2.bank')
+    expect(
+      useDuplicateStore.getState().selectedPaths.has('/games/ac/cars/car2/sfx/car2.bank')
+    ).toBe(false)
+
+    // Switching to hardlink mode allows selecting protected game audio to save space safely
+    store.setDeleteMode('hardlink')
+    store.togglePath('/games/ac/cars/car2/sfx/car2.bank')
+    expect(
+      useDuplicateStore.getState().selectedPaths.has('/games/ac/cars/car2/sfx/car2.bank')
+    ).toBe(true)
+
+    // Switching back to recycle mode automatically deselects protected game files
+    store.setDeleteMode('recycle')
+    expect(
+      useDuplicateStore.getState().selectedPaths.has('/games/ac/cars/car2/sfx/car2.bank')
+    ).toBe(false)
+  })
 })
